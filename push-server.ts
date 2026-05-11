@@ -82,8 +82,15 @@ app.post("/push/send", async (req, res) => {
   const {
     title = "MBFS Point of Sales",
     body = "Sie haben einen offenen Antrag.",
+    url,
+    icon,
   } = req.body;
-  const payload = JSON.stringify({ title, body });
+  const payload = JSON.stringify({
+    title,
+    body,
+    icon,
+    data: { url: url ?? "/" },
+  });
 
   const results = await Promise.allSettled(
     [...subscriptions.values()].map((sub) =>
