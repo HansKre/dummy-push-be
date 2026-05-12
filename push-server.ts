@@ -23,11 +23,42 @@ try {
   );
 }
 
-// ── In-memory subscription store ──────────────────────────────
-const subscriptions = new Map<string, webpush.PushSubscription>();
+// ── Types ─────────────────────────────────────────────────────
+type Topic = { antragId: string };
 
-function keyOf(sub: webpush.PushSubscription): string {
-  return sub.endpoint;
+type StoredSubscription = {
+  subscription: webpush.PushSubscription;
+  topics: Topic[];
+};
+
+// ── In-memory subscription store ──────────────────────────────
+const subscriptions = new Map<string, StoredSubscription>();
+
+function normalizeTopics(topics: Topic[]): Topic[] {
+  const seen = new Set<string>();
+  const result: Topic[] = [];
+  for (const topic of topics) {
+    const id = topic.antragId.trim();
+    if (id && !seen.has(id)) {
+      seen.add(id);
+      result.push({ antragId: id });
+    }
+  }
+  return result;
+}
+
+function isValidTopicsArray(value: unknown): value is Topic[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every(
+      (t) =>
+        typeof t === "object" &&
+        t !== null &&
+        typeof (t as Topic).antragId === "string" &&
+        (t as Topic).antragId.trim().length > 0,
+    )
+  );
 }
 
 function isPermanentPushError(error: unknown): boolean {
@@ -45,31 +76,93 @@ app.use(cors());
 app.use(express.json());
 
 // Subscribe — called from the frontend after pushManager.subscribe()
+// Body: { subscription: PushSubscription, topics: [{ antragId: "12345" }] }
 app.post("/push/subscribe", (req, res) => {
-  const sub = req.body as webpush.PushSubscription;
-  if (!sub?.endpoint) {
+  const { subscription, topics } = req.body;
+
+  if (!subscription?.endpoint) {
     res.status(400).json({ error: "Invalid subscription: missing endpoint" });
     return;
   }
-  subscriptions.set(keyOf(sub), sub);
-  console.log(`[push] subscribed (${subscriptions.size} total)`);
-  res.status(201).json({ ok: true });
+
+  if (!isValidTopicsArray(topics)) {
+    res
+      .status(400)
+      .json({ error: "topics must be a non-empty array of { antragId: string }" });
+    return;
+  }
+
+  const normalized = normalizeTopics(topics);
+  subscriptions.set(subscription.endpoint, {
+    subscription,
+    topics: normalized,
+  });
+  console.log(
+    `[push] subscribed (${subscriptions.size} total), topics: ${JSON.stringify(normalized)}`,
+  );
+  res.status(201).json({ ok: true, topics: normalized });
 });
 
 // Unsubscribe
 app.post("/push/unsubscribe", (req, res) => {
-  const sub = req.body as webpush.PushSubscription;
-  if (!sub?.endpoint) {
-    res.status(400).json({ error: "Invalid subscription: missing endpoint" });
+  const { endpoint } = req.body;
+  if (!endpoint) {
+    res.status(400).json({ error: "Missing endpoint" });
     return;
   }
-  subscriptions.delete(keyOf(sub));
+  subscriptions.delete(endpoint);
   console.log(`[push] unsubscribed (${subscriptions.size} total)`);
   res.status(200).json({ ok: true });
 });
 
-// Send push to ALL subscribers
-// Body: { "title": "...", "body": "..." }
+// Update topics — replace the full topic set for an existing subscription
+// Body: { endpoint: string, topics: [{ antragId: string }] }
+// Empty topics → auto-unsubscribe
+app.put("/push/topics", (req, res) => {
+  const { endpoint, topics } = req.body;
+
+  if (!endpoint) {
+    res.status(400).json({ error: "Missing endpoint" });
+    return;
+  }
+
+  const stored = subscriptions.get(endpoint);
+  if (!stored) {
+    res.status(404).json({ error: "Subscription not found" });
+    return;
+  }
+
+  if (!Array.isArray(topics)) {
+    res.status(400).json({ error: "topics must be an array" });
+    return;
+  }
+
+  if (topics.length === 0) {
+    subscriptions.delete(endpoint);
+    console.log(
+      `[push] auto-unsubscribed (topics empty, ${subscriptions.size} remaining)`,
+    );
+    res.status(200).json({ unsubscribed: true });
+    return;
+  }
+
+  if (!isValidTopicsArray(topics)) {
+    res
+      .status(400)
+      .json({ error: "topics must contain objects with { antragId: string }" });
+    return;
+  }
+
+  const normalized = normalizeTopics(topics);
+  stored.topics = normalized;
+  console.log(
+    `[push] topics updated for ${endpoint.slice(0, 40)}…: ${JSON.stringify(normalized)}`,
+  );
+  res.status(200).json({ topics: normalized });
+});
+
+// Send push to subscribers matching a topic
+// Body: { topic: { antragId: "12345" }, title: "...", body: "..." }
 app.post("/push/send", async (req, res) => {
   if (!vapidConfigured) {
     res.status(503).json({
@@ -79,33 +172,40 @@ app.post("/push/send", async (req, res) => {
     return;
   }
 
-  const {
-    title = "MBFS Point of Sales",
-    body = "Sie haben einen offenen Antrag.",
-    url,
-    icon,
-  } = req.body;
+  const { topic, title = "MBFS Point of Sales", body, url, icon } = req.body;
+
+  if (!topic?.antragId) {
+    res
+      .status(400)
+      .json({ error: "topic is required: { antragId: string }" });
+    return;
+  }
+
+  const targetAntragId = topic.antragId.trim();
+  const matchingSubs = [...subscriptions.entries()].filter(([, stored]) =>
+    stored.topics.some((t) => t.antragId === targetAntragId),
+  );
+
   const payload = JSON.stringify({
     title,
-    body,
+    body: body ?? "Sie haben einen offenen Antrag.",
     icon,
     data: { url: url ?? "/" },
   });
 
   const results = await Promise.allSettled(
-    [...subscriptions.values()].map((sub) =>
-      webpush.sendNotification(sub, payload),
+    matchingSubs.map(([, stored]) =>
+      webpush.sendNotification(stored.subscription, payload),
     ),
   );
 
-  // Remove only expired / invalid subscriptions (permanent failures)
   const gone: string[] = [];
   let failed = 0;
   results.forEach((r, i) => {
     if (r.status === "rejected") {
       failed += 1;
       if (isPermanentPushError(r.reason)) {
-        const endpoint = [...subscriptions.keys()][i];
+        const endpoint = matchingSubs[i][0];
         subscriptions.delete(endpoint);
         gone.push(endpoint);
       }
@@ -113,16 +213,34 @@ app.post("/push/send", async (req, res) => {
   });
 
   const sent = results.filter((r) => r.status === "fulfilled").length;
-  console.log(`[push] sent=${sent}, failed=${failed}, removed=${gone.length}`);
-  res.json({ sent, failed, removed: gone.length, total: subscriptions.size });
+  console.log(
+    `[push] topic=${targetAntragId} matched=${matchingSubs.length} sent=${sent} failed=${failed} removed=${gone.length}`,
+  );
+  res.json({
+    sent,
+    failed,
+    removed: gone.length,
+    matched: matchingSubs.length,
+    total: subscriptions.size,
+  });
 });
 
 // List current subscribers (debug)
-app.get("/push/subscriptions", (_, res) => {
-  res.json({
-    count: subscriptions.size,
-    endpoints: [...subscriptions.values()].map((s) => s.endpoint),
-  });
+app.get("/push/subscriptions", (req, res) => {
+  const antragIdFilter = req.query.antragId as string | undefined;
+
+  const entries = [...subscriptions.values()]
+    .filter(
+      (stored) =>
+        !antragIdFilter ||
+        stored.topics.some((t) => t.antragId === antragIdFilter.trim()),
+    )
+    .map((stored) => ({
+      endpoint: stored.subscription.endpoint,
+      topics: stored.topics,
+    }));
+
+  res.json({ count: entries.length, subscriptions: entries });
 });
 
 // ── Start ─────────────────────────────────────────────────────
@@ -136,8 +254,9 @@ if (!vapidConfigured) {
 
 app.listen(PORT, () => {
   console.log(`[push-server] running on http://localhost:${PORT}`);
-  console.log(`  POST /push/subscribe     — register a subscription`);
-  console.log(`  POST /push/unsubscribe   — remove a subscription`);
-  console.log(`  POST /push/send          — send to all subscribers`);
+  console.log(`  POST /push/subscribe      — register with topics`);
+  console.log(`  POST /push/unsubscribe    — remove a subscription`);
+  console.log(`  PUT  /push/topics         — replace topics for a subscription`);
+  console.log(`  POST /push/send           — send to matching subscribers`);
   console.log(`  GET  /push/subscriptions  — list current subscribers`);
 });
