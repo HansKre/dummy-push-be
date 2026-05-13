@@ -29,6 +29,7 @@ type Topic = { antragId: string };
 type StoredSubscription = {
   subscription: webpush.PushSubscription;
   topics: Topic[];
+  lastSavedAt: string;
 };
 
 // ── In-memory subscription store ──────────────────────────────
@@ -96,6 +97,7 @@ app.post("/push/subscribe", (req, res) => {
   subscriptions.set(subscription.endpoint, {
     subscription,
     topics: normalized,
+    lastSavedAt: new Date().toISOString(),
   });
   console.log(
     `[push] subscribed (${subscriptions.size} total), topics: ${JSON.stringify(normalized)}`,
@@ -155,6 +157,7 @@ app.put("/push/topics", (req, res) => {
 
   const normalized = normalizeTopics(topics);
   stored.topics = normalized;
+  stored.lastSavedAt = new Date().toISOString();
   console.log(
     `[push] topics updated for ${endpoint.slice(0, 40)}…: ${JSON.stringify(normalized)}`,
   );
@@ -238,6 +241,7 @@ app.get("/push/subscriptions", (req, res) => {
     .map((stored) => ({
       endpoint: stored.subscription.endpoint,
       topics: stored.topics,
+      lastSavedAt: stored.lastSavedAt,
     }));
 
   res.json({ count: entries.length, subscriptions: entries });
